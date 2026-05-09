@@ -178,6 +178,7 @@ static bool azure_do_request(const struct azure_settings *settings,
 
   uint32_t retries = settings->max_retries;
   for (uint32_t attempt = 0; attempt <= retries; attempt++) {
+
     CURL *curl = curl_easy_init();
     if (!curl) {
       g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
@@ -210,6 +211,9 @@ static bool azure_do_request(const struct azure_settings *settings,
     struct cloud_grow_ctx grow = {0};
     curl_easy_setopt(curl, CURLOPT_URL, url);
     curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method);
+    if (g_str_equal(method, "HEAD")) {
+      curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
+    }
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     bool has_auth = (settings->bearer_token && settings->bearer_token[0]) ||
             (settings->sas_token && settings->sas_token[0]);
@@ -233,7 +237,14 @@ static bool azure_do_request(const struct azure_settings *settings,
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
 
-    if (cc == CURLE_OK && (status >= 200 && status < 300)) {
+    bool http_success = (status >= 200 && status < 300);
+    bool missing_status = (status == 0);
+    bool head_header_only_success =
+      (g_str_equal(method, "HEAD") &&
+       (cc == CURLE_OPERATION_TIMEDOUT || cc == CURLE_PARTIAL_FILE) &&
+       (http_success || missing_status));
+
+    if ((cc == CURLE_OK && http_success) || head_header_only_success) {
       result->http_status = status;
       result->body = grow.buf;
       result->body_len = grow.len;

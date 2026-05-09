@@ -24,8 +24,6 @@
 #include "openslide-private.h"
 #include "openslide-storage-internal.h"
 
-#include <stdarg.h>
-
 #ifdef HAVE_GCS_PROVIDER
 static const struct _openslide_storage_provider_ops gcs_provider_ops;
 static const struct _openslide_readable_ops gcs_readable_ops;
@@ -33,34 +31,6 @@ static const struct _openslide_readable_ops gcs_readable_ops;
 static struct _openslide_storage_provider gcs_provider = {
   .ops = &gcs_provider_ops,
 };
-
-static bool gcs_trace_enabled(void) {
-  const char *debug = g_getenv("OPENSLIDE_DEBUG");
-  if (!debug) {
-    return false;
-  }
-
-  g_auto(GStrv) options = g_strsplit(debug, ",", -1);
-  for (char **option = options; *option != NULL; option++) {
-    g_strstrip(*option);
-    if (g_ascii_strcasecmp(*option, "detection") == 0) {
-      return true;
-    }
-  }
-  return false;
-}
-
-static void gcs_trace(const char *format, ...) {
-  if (!gcs_trace_enabled()) {
-    return;
-  }
-
-  va_list ap;
-  va_start(ap, format);
-  g_autofree char *msg = g_strdup_vprintf(format, ap);
-  va_end(ap);
-  g_message("gcs: %s", msg);
-}
 
 static void secure_zero_free(char *secret) {
   if (!secret) {
@@ -166,24 +136,39 @@ static bool gcs_do_request(const struct gcs_settings *settings,
                            struct gcs_http_result *result,
                            GError **err) {
   g_autofree char *escaped_key = gcs_uri_encode_path(key);
-  g_autofree char *url = g_strdup_printf("https://%s/%s%s%s%s",
-                                         settings->endpoint,
-                                         bucket,
-                                         escaped_key,
-                                         query ? "?" : "",
-                                         query ? query : "");
+  g_autofree char *path_url = g_strdup_printf("https://%s/%s%s%s%s",
+                                              settings->endpoint,
+                                              bucket,
+                                              escaped_key,
+                                              query ? "?" : "",
+                                              query ? query : "");
+
+  g_autofree char *json_url = NULL;
+  if (key && key[0] && query == NULL &&
+      (g_str_equal(method, "HEAD") || g_str_equal(method, "GET"))) {
+    g_autofree char *encoded_object = g_uri_escape_string(key, NULL, true);
+    if (g_str_equal(method, "HEAD")) {
+      json_url = g_strdup_printf(
+        "https://%s/storage/v1/b/%s/o/%s",
+        settings->endpoint,
+        bucket,
+        encoded_object
+      );
+    } else {
+      json_url = g_strdup_printf(
+        "https://%s/download/storage/v1/b/%s/o/%s?alt=media",
+        settings->endpoint,
+        bucket,
+        encoded_object
+      );
+    }
+  }
+
+  bool use_json_api = false;
 
   uint32_t retries = settings->max_retries;
   for (uint32_t attempt = 0; attempt <= retries; attempt++) {
-    gcs_trace("request begin method=%s attempt=%u/%u bucket=%s key=%s endpoint=%s query=%s range=%s",
-              method,
-              attempt + 1,
-              retries + 1,
-              bucket,
-              key,
-              settings->endpoint,
-              query ? query : "(none)",
-              range_header ? range_header : "(none)");
+    const char *active_url = use_json_api && json_url ? json_url : path_url;
 
     CURL *curl = curl_easy_init();
     if (!curl) {
@@ -208,8 +193,11 @@ static bool gcs_do_request(const struct gcs_settings *settings,
     }
 
     struct cloud_grow_ctx grow = {0};
-    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_URL, active_url);
     curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method);
+    if (g_str_equal(method, "HEAD")) {
+      curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
+    }
     if (headers) {
       curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     }
@@ -234,17 +222,6 @@ static bool gcs_do_request(const struct gcs_settings *settings,
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
 
-    gcs_trace("request end method=%s attempt=%u/%u bucket=%s key=%s curl=%d status=%ld body_len=%zu content_length=%" PRId64,
-          method,
-          attempt + 1,
-          retries + 1,
-          bucket,
-          key,
-          cc,
-          status,
-          grow.len,
-          content_length >= 0 ? (int64_t) content_length : -1);
-
      bool http_success = (status >= 200 && status < 300);
      bool missing_status = (status == 0);
     bool head_header_only_success =
@@ -260,16 +237,15 @@ static bool gcs_do_request(const struct gcs_settings *settings,
       return true;
     }
 
+    if (!use_json_api && json_url && status == 404) {
+      use_json_api = true;
+      g_free(grow.buf);
+      continue;
+    }
+
     bool retry = cloud_is_retryable_curl(cc) || cloud_is_retryable_http(status);
     g_free(grow.buf);
     if (!retry || attempt == retries) {
-      gcs_trace("request terminal failure method=%s bucket=%s key=%s curl=%d status=%ld retry=%s",
-                method,
-                bucket,
-                key,
-                cc,
-                status,
-                retry ? "yes" : "no");
       if (cc != CURLE_OK) {
         g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
                     "GCS %s failed for gs://%s/%s: %s",
@@ -289,11 +265,6 @@ static bool gcs_do_request(const struct gcs_settings *settings,
     }
 
     uint64_t backoff_ms = 100ULL << attempt;
-    gcs_trace("request retry method=%s bucket=%s key=%s backoff_ms=%" PRIu64,
-              method,
-              bucket,
-              key,
-              backoff_ms);
     g_usleep(backoff_ms * 1000);
   }
 
