@@ -39,6 +39,17 @@
 // SHA-256 of no bytes
 #define UNINIT_QUICKHASH "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
+static bool is_uri(const char *path) {
+  return g_str_has_prefix(path, "s3://") ||
+         g_str_has_prefix(path, "gs://") ||
+         g_str_has_prefix(path, "az://") ||
+         g_str_has_prefix(path, "file://");
+}
+
+static openslide_t *open_slide(const char *path) {
+  return is_uri(path) ? openslide_open_uri(path) : openslide_open(path);
+}
+
 static void test_image_fetch(openslide_t *osr,
 			     int64_t x, int64_t y,
 			     int64_t w, int64_t h) {
@@ -130,7 +141,7 @@ static void check_cloexec_leaks(const char *slide, void *prog,
   guint32 buf[512 * 512];
   g_autoptr(GTimer) timer = g_timer_new();
   while (g_timer_elapsed(timer, NULL) < 2) {
-    openslide_t *osr = openslide_open(slide);
+    openslide_t *osr = open_slide(slide);
     openslide_read_region(osr, buf, x, y, 0, 512, 512);
     openslide_close(osr);
   }
@@ -194,7 +205,7 @@ static void cache_thread_start(struct cache_thread_params *param_array,
 static void check_shared_cache(const char *slide) {
   openslide_t *osrs[CACHE_THREADS];
   for (int i = 0; i < CACHE_THREADS; i++) {
-    osrs[i] = openslide_open(slide);
+    osrs[i] = open_slide(slide);
     g_assert(osrs[i]);
     g_assert(openslide_get_error(osrs[i]) == NULL);
   }
@@ -235,16 +246,25 @@ int main(int argc, char **argv) {
 
   openslide_get_version();
 
-  if (!openslide_detect_vendor(path)) {
+  const bool path_is_uri = is_uri(path);
+
+  const char *vendor = path_is_uri ? NULL : openslide_detect_vendor(path);
+  if (!path_is_uri && !vendor) {
     common_fail("No vendor for %s", path);
   }
 
-  openslide_t *osr = openslide_open(path);
+  openslide_t *osr = open_slide(path);
   common_fail_on_error(osr, "Couldn't open %s", path);
+  if (path_is_uri) {
+    vendor = openslide_get_property_value(osr, OPENSLIDE_PROPERTY_NAME_VENDOR);
+    if (!vendor) {
+      common_fail("No vendor for %s", path);
+    }
+  }
   libtest_check_open_fds(fds, "Open file descriptor after openslide_open()");
   openslide_close(osr);
 
-  osr = openslide_open(path);
+  osr = open_slide(path);
   common_fail_on_error(osr, "Reopen of %s failed", path);
 
   int64_t w, h;

@@ -214,14 +214,16 @@ int main(int argc, char **argv) {
       print_log, NULL);
 
   const bool path_is_uri = is_uri(filename);
+  bool can_check_vendor = !path_is_uri;
   const char *vendor = path_is_uri ? NULL : openslide_detect_vendor(filename);
   openslide_t *osr = path_is_uri ? openslide_open_uri(filename) : openslide_open(filename);
   if (vendor == NULL && osr != NULL && openslide_get_error(osr) == NULL) {
     vendor = openslide_get_property_value(osr, OPENSLIDE_PROPERTY_NAME_VENDOR);
+    can_check_vendor = true;
   }
 
   // Check vendor if requested
-  if (vendor_check) {
+  if (vendor_check && can_check_vendor) {
     const char *expected_vendor = vendor_check;
     if (!strcmp(expected_vendor, "none")) {
       expected_vendor = NULL;

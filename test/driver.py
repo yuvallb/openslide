@@ -131,7 +131,10 @@ BLUE = '\033[1;34m'
 RED = '\033[1;31m'
 RESET = '\033[1;0m'
 
-CLOUD_TEST_CASE = os.getenv('OPENSLIDE_CLOUD_TEST_CASE', 'aperio-small-region')
+CLOUD_TEST_PATTERN = os.getenv(
+    'OPENSLIDE_CLOUD_TEST_PATTERN',
+    os.getenv('OPENSLIDE_CLOUD_TEST_CASE', '*'),
+)
 CLOUD_TEST_BUCKET = 'openslide-cloud-test'
 CLOUD_TEST_CONTAINER = 'slides'
 AZURITE_DEFAULT_ACCOUNT = 'devstoreaccount1'
@@ -278,10 +281,17 @@ class BaseSlide:
 class UnpackedSlide:
     """A slide unpacked into a directory so that programs can be run on it."""
 
-    def __init__(self, path: Path | None):
-        # path of the actual slide file to open
-        self.path = path
-        self.path_str = path.as_posix() if path else ''
+    def __init__(
+        self,
+        target: Path | str | None,
+        env: dict[str, str] | None = None,
+    ):
+        # path or URI of the actual slide resource to open
+        self.target = target
+        self.target_str = (
+            target.as_posix() if isinstance(target, Path) else (target or '')
+        )
+        self.env = env or {}
 
     def run_prog(
         self,
@@ -333,7 +343,8 @@ class UnpackedSlide:
                 # https://github.com/libjpeg-turbo/libjpeg-turbo/issues/277
                 JSIMD_FORCENONE='1',
             )
-        args_.extend([progdir / prog, self.path_str])
+        env.update(self.env)
+        args_.extend([progdir / prog, self.target_str])
         if args:
             args_.extend(args)
         return subprocess.Popen(args_, env=env, text=True, **kwargs)
@@ -407,6 +418,52 @@ class UnpackedSlide:
             return f'Exited with status {proc.returncode}'
         else:
             return None
+
+
+def _evaluate_test_case(
+    testname: str,
+    conf: TestCaseConfig,
+    unpacked: UnpackedSlide,
+    valgrind: bool = False,
+    xfail: bool = False,
+    progdir: Path | None = None,
+) -> tuple[bool, str, str | None]:
+    result = unpacked.try_open(
+        valgrind,
+        progdir,
+        vendor=conf.vendor,
+        properties=conf.properties,
+        regions=conf.regions,
+        debug=conf.debug,
+    )
+
+    msg = _color(GREEN, f'{testname}: OK')
+    ok = True
+    detail = result
+    if result is None and not conf.success:
+        msg = _color(RED, f'{testname}: unexpected success')
+        ok = False
+    elif result is not None and conf.success:
+        msg = _color(RED, f'{testname}: unexpected failure: {result}')
+        ok = False
+    elif result is not None and not conf.error.search(result):
+        msg = _color(RED, f'{testname}: incorrect error: {result}')
+        ok = False
+    elif conf.primary and conf.success:
+        result = unpacked.try_extended(valgrind, progdir, debug=conf.debug)
+        detail = result
+        if result:
+            msg = _color(RED, f'{testname}: extended test failed: {result}')
+            ok = False
+
+    if xfail:
+        ok = not ok
+        if ok:
+            msg = _color(BLUE, f'{testname}: failed as expected')
+        else:
+            msg = _color(RED, f'{testname}: expected to fail, but passed')
+
+    return ok, msg, detail
 
 
 class TestCaseConfig:
@@ -723,6 +780,8 @@ class TestCase:
         xfail: bool = False,
         progdir: Path | None = None,
         workdir: Path = WORKROOT,
+        target: Path | str | None = None,
+        extra_env: dict[str, str] | None = None,
     ) -> tuple[bool, str]:
         """Run the test, under Valgrind if specified.  Also execute extended
         tests against cases which 1) are marked primary, 2) are expected to
@@ -732,44 +791,20 @@ class TestCase:
         conf = self.conf
         if not conf.features_available:
             return True, _color(BLUE, f'{self}: skipped')
-        if conf.filename == '':
-            # synthetic test slide
-            unpacked = UnpackedSlide(None)
-        else:
-            unpacked = UnpackedSlide(workdir / self.name / conf.filename)
-        result = unpacked.try_open(
-            valgrind,
-            progdir,
-            vendor=conf.vendor,
-            properties=conf.properties,
-            regions=conf.regions,
-            debug=conf.debug,
-        )
-
-        msg = _color(GREEN, f'{self}: OK')
-        ok = True
-        if result is None and not conf.success:
-            msg = _color(RED, f'{self}: unexpected success')
-            ok = False
-        elif result is not None and conf.success:
-            msg = _color(RED, f'{self}: unexpected failure: {result}')
-            ok = False
-        elif result is not None and not conf.error.search(result):
-            msg = _color(RED, f'{self}: incorrect error: {result}')
-            ok = False
-        elif conf.primary and conf.success:
-            result = unpacked.try_extended(valgrind, progdir, debug=conf.debug)
-            if result:
-                msg = _color(RED, f'{self}: extended test failed: {result}')
-                ok = False
-
-        if xfail:
-            ok = not ok
-            if ok:
-                msg = _color(BLUE, f'{self}: failed as expected')
+        if target is None:
+            if conf.filename == '':
+                target = None
             else:
-                msg = _color(RED, f'{self}: expected to fail, but passed')
-
+                target = workdir / self.name / conf.filename
+        unpacked = UnpackedSlide(target, env=extra_env)
+        ok, msg, _ = _evaluate_test_case(
+            self.name,
+            conf,
+            unpacked,
+            valgrind=valgrind,
+            xfail=xfail,
+            progdir=progdir,
+        )
         return ok, msg
 
 
@@ -837,19 +872,18 @@ class S3Uploader:
         print('{:<79}'.format(f'Uploaded {length >> 20} MB'))
 
 
-def _cloud_prepare_case(testname: str) -> tuple[TestCaseConfig, Path, list[Path]]:
-    test = TestCase(testname)
+def _cloud_prepare_case(test: TestCase) -> tuple[TestCaseConfig, Path, list[Path]]:
     conf = test.conf
-    if not conf.success:
-        raise ValueError(f'Cloud test case must succeed: {testname}')
     if conf.filename == '':
-        raise ValueError(f'Cloud test case must have a slide filename: {testname}')
+        raise ValueError(
+            f'Cloud test case must have a slide filename: {test.name}'
+        )
 
     test.unpack()
     root = WORKROOT / test.name
     files = sorted(path for path in root.rglob('*') if path.is_file())
     if not files:
-        raise OSError(f'No unpacked files found for {testname}')
+        raise OSError(f'No unpacked files found for {test.name}')
     return conf, root, files
 
 
@@ -899,11 +933,9 @@ def _cloud_base_env(cert_path: Path) -> dict[str, str]:
         AWS_CA_BUNDLE=cert_path.as_posix(),
         AWS_EC2_METADATA_DISABLED='true',
         CURL_CA_BUNDLE=cert_path.as_posix(),
-        G_MESSAGES_DEBUG='all',
         GIO_USE_VFS='local',
         NO_PROXY=','.join(dict.fromkeys(no_proxy)),
         OPENSLIDE_CLOUD_INSECURE_SKIP_VERIFY='1',
-        OPENSLIDE_DEBUG='detection',
         REQUESTS_CA_BUNDLE=cert_path.as_posix(),
         SSL_CERT_FILE=cert_path.as_posix(),
     )
@@ -972,7 +1004,12 @@ def _cloud_upload_s3(
                 raise
             sleep(0.25)
 
-    client.create_bucket(Bucket=CLOUD_TEST_BUCKET)
+    try:
+        client.create_bucket(Bucket=CLOUD_TEST_BUCKET)
+    except client.exceptions.ClientError as exc:
+        code = exc.response['Error'].get('Code', '')
+        if code not in {'BucketAlreadyOwnedByYou', 'BucketAlreadyExists'}:
+            raise
     client.put_bucket_policy(
         Bucket=CLOUD_TEST_BUCKET,
         Policy=json.dumps(
@@ -1109,68 +1146,20 @@ def _cloud_upload_gcs(
         upload.raise_for_status()
 
 
-def _cloud_run_try_open(
-    label: str,
-    target: str,
-    conf: TestCaseConfig,
-    extra_env: dict[str, str],
-) -> None:
-    env = _cloud_base_env(Path(extra_env['CURL_CA_BUNDLE']))
+def _cloud_provider_env(cert_path: Path, extra_env: dict[str, str]) -> dict[str, str]:
+    env = _cloud_base_env(cert_path)
     env.update(extra_env)
-
-    args: list[str] = [(BUILDDIR / 'try_open').as_posix()]
-    for key, value in sorted(conf.properties.items()):
-        args.extend(['--property', f'{key}={value}'])
-    regions = conf.regions or [[0, 0, 0, 1, 1]]
-    for region in regions:
-        args.extend(['--region', ' '.join(str(value) for value in region)])
-    args.append(target)
-
-    print(f'cloud test: opening {label} target {target}', file=sys.stderr)
-    sys.stderr.flush()
-
-    try:
-        proc = subprocess.run(
-            args,
-            env=env,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=120,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        timeout_stdout = exc.stdout or ''
-        timeout_stderr = exc.stderr or ''
-        if isinstance(timeout_stdout, bytes):
-            timeout_stdout = timeout_stdout.decode(errors='replace')
-        if isinstance(timeout_stderr, bytes):
-            timeout_stderr = timeout_stderr.decode(errors='replace')
-        partial = '\n'.join(
-            part
-            for part in [
-                timeout_stdout.strip(),
-                timeout_stderr.strip(),
-            ]
-            if part
-        )
-        if partial:
-            raise TimeoutError(
-                f'Cloud open timed out for {label}: {target}\n{partial}'
-            ) from exc
-        raise TimeoutError(f'Cloud open timed out for {label}: {target}') from exc
-
-    out = proc.stdout
-    err = proc.stderr
-    if proc.returncode:
-        details = '\n'.join(part for part in [out.strip(), err.strip()] if part)
-        raise OSError(
-            f'Cloud open failed for {target}: {details or f"exit {proc.returncode}"}'
-        )
+    return env
 
 
-def _cloud_test_summary(label: str, target: str) -> None:
-    print(_color(GREEN, f'{label}: OK ({target})'))
+def _cloud_skip_reason(test: TestCase) -> str | None:
+    if test.conf.filename == '':
+        return 'synthetic case has no concrete slide object'
+    return None
+
+
+def _cloud_provider_message(label: str, msg: str) -> str:
+    return f'{label} {msg}'
 
 
 def _cloud_require_features() -> None:
@@ -1183,8 +1172,8 @@ def _cloud_require_features() -> None:
 
 
 @_command
-def cloud(testname: str = CLOUD_TEST_CASE) -> None:
-    """Run Docker-backed cloud read tests against S3, GCS, and Azure emulators."""
+def cloud(pattern: str = CLOUD_TEST_PATTERN) -> None:
+    """Run Docker-backed cloud tests against S3, GCS, and Azure emulators."""
     _cloud_require_features()
 
     try:
@@ -1204,9 +1193,9 @@ def cloud(testname: str = CLOUD_TEST_CASE) -> None:
     except (FileNotFoundError, subprocess.CalledProcessError) as exc:
         raise RuntimeError('Docker must be available for cloud tests') from exc
 
-    conf, slide_root, files = _cloud_prepare_case(testname)
-    prefix = PurePath('slides') / testname
-    main_object = prefix / PurePath(conf.filename)
+    tests = TestCase.list(pattern)
+    if not tests:
+        raise ValueError(f'No tests matched pattern: {pattern}')
 
     with TemporaryDirectory(prefix='openslide-cloud-') as tempdir_name:
         tempdir = Path(tempdir_name)
@@ -1268,71 +1257,138 @@ def cloud(testname: str = CLOUD_TEST_CASE) -> None:
                 {200},
             )
 
-            _cloud_upload_s3(
-                f'localhost:{minio_port}',
-                cert_path,
-                slide_root,
-                files,
-                prefix,
-            )
-            _cloud_upload_gcs(
-                gcs_port,
-                cert_path,
-                slide_root,
-                files,
-                prefix,
-            )
-            azure_sas = _cloud_upload_azure(
-                azurite_port,
-                cert_path,
-                slide_root,
-                files,
-                prefix,
-            )
+            provider_envs = {
+                'S3': _cloud_provider_env(
+                    cert_path,
+                    {
+                        'OPENSLIDE_S3_ENDPOINT': f'localhost:{minio_port}',
+                        'OPENSLIDE_S3_REGION': 'us-east-1',
+                    },
+                ),
+                'GCS': _cloud_provider_env(
+                    cert_path,
+                    {
+                        'OPENSLIDE_GCS_ENDPOINT': f'localhost:{gcs_port}',
+                    },
+                ),
+            }
 
-            s3_target = f's3://{CLOUD_TEST_BUCKET}/{main_object.as_posix()}'
-            gcs_target = f'gs://{CLOUD_TEST_BUCKET}/{main_object.as_posix()}'
-            azure_target = (
-                f'az://{AZURITE_DEFAULT_ACCOUNT}/{CLOUD_TEST_CONTAINER}/'
-                f'{main_object.as_posix()}'
-            )
+            total_failures = 0
+            skipped_nonportable: list[tuple[str, str]] = []
+            nonportable_failures: list[tuple[str, list[str]]] = []
+            provider_mismatches: list[tuple[str, list[str]]] = []
 
-            _cloud_run_try_open(
-                'S3',
-                s3_target,
-                conf,
-                {
-                    'CURL_CA_BUNDLE': cert_path.as_posix(),
-                    'OPENSLIDE_S3_ENDPOINT': f'localhost:{minio_port}',
-                    'OPENSLIDE_S3_REGION': 'us-east-1',
-                },
-            )
-            _cloud_test_summary('S3', s3_target)
+            for test in tests:
+                reason = _cloud_skip_reason(test)
+                if reason is not None:
+                    skipped_nonportable.append((test.name, reason))
+                    print(_color(BLUE, f'{test.name}: skipped ({reason})'))
+                    continue
 
-            _cloud_run_try_open(
-                'GCS',
-                gcs_target,
-                conf,
-                {
-                    'CURL_CA_BUNDLE': cert_path.as_posix(),
-                    'OPENSLIDE_GCS_ENDPOINT': f'localhost:{gcs_port}',
-                },
-            )
-            _cloud_test_summary('GCS', gcs_target)
+                conf, slide_root, files = _cloud_prepare_case(test)
+                prefix = PurePath('slides') / test.name
+                main_object = prefix / PurePath(conf.filename)
 
-            _cloud_run_try_open(
-                'Azure',
-                azure_target,
-                conf,
-                {
-                    'CURL_CA_BUNDLE': cert_path.as_posix(),
-                    'OPENSLIDE_AZURE_ENDPOINT_SUFFIX': (
-                        f'blob.localhost:{azurite_port}'
+                _cloud_upload_s3(
+                    f'localhost:{minio_port}',
+                    cert_path,
+                    slide_root,
+                    files,
+                    prefix,
+                )
+                _cloud_upload_gcs(
+                    gcs_port,
+                    cert_path,
+                    slide_root,
+                    files,
+                    prefix,
+                )
+                azure_sas = _cloud_upload_azure(
+                    azurite_port,
+                    cert_path,
+                    slide_root,
+                    files,
+                    prefix,
+                )
+                provider_envs['Azure'] = _cloud_provider_env(
+                    cert_path,
+                    {
+                        'OPENSLIDE_AZURE_ENDPOINT_SUFFIX': (
+                            f'blob.localhost:{azurite_port}'
+                        ),
+                        'OPENSLIDE_AZURE_SAS_TOKEN': azure_sas,
+                    },
+                )
+
+                targets = {
+                    'S3': f's3://{CLOUD_TEST_BUCKET}/{main_object.as_posix()}',
+                    'GCS': f'gs://{CLOUD_TEST_BUCKET}/{main_object.as_posix()}',
+                    'Azure': (
+                        f'az://{AZURITE_DEFAULT_ACCOUNT}/{CLOUD_TEST_CONTAINER}/'
+                        f'{main_object.as_posix()}'
                     ),
-                    'OPENSLIDE_AZURE_SAS_TOKEN': azure_sas,
-                },
-            )
-            _cloud_test_summary('Azure', azure_target)
+                }
+
+                provider_failures: list[str] = []
+                local_ok: bool | None = None
+
+                for label in ['S3', 'GCS', 'Azure']:
+                    ok, msg = test.run(
+                        target=targets[label],
+                        extra_env=provider_envs[label],
+                    )
+                    print(_cloud_provider_message(label, msg))
+                    if not ok:
+                        total_failures += 1
+                        provider_failures.append(label)
+
+                if not conf.success and provider_failures:
+                    local_ok, local_msg = test.run()
+                    if local_ok:
+                        details = [
+                            _cloud_provider_message(
+                                label,
+                                test.run(
+                                    target=targets[label],
+                                    extra_env=provider_envs[label],
+                                )[1],
+                            )
+                            for label in provider_failures
+                        ]
+                        if len(provider_failures) == 3:
+                            nonportable_failures.append((test.name, details))
+                        else:
+                            provider_mismatches.append((test.name, details))
+                    elif not local_ok:
+                        print(
+                            _color(
+                                BLUE,
+                                (
+                                    f'{test.name}: local baseline also mismatched '
+                                    f'({local_msg})'
+                                ),
+                            )
+                        )
+
+            print(f'\nCloud failures: {total_failures}')
+            if skipped_nonportable:
+                print('\nSkipped as non-portable to object storage:')
+                for testname, reason in skipped_nonportable:
+                    print(f'  {testname}: {reason}')
+            if nonportable_failures:
+                print('\nExpected-failure cases not portable to object storage:')
+                for testname, details in nonportable_failures:
+                    print(f'  {testname}')
+                    for detail in details:
+                        print(f'    {detail}')
+            if provider_mismatches:
+                print('\nExpected-failure cases with provider-specific mismatches:')
+                for testname, details in provider_mismatches:
+                    print(f'  {testname}')
+                    for detail in details:
+                        print(f'    {detail}')
+            if total_failures:
+                sys.exit(1)
 
 
 def _download(url: str, name: str, fh: BinaryIO) -> str:
