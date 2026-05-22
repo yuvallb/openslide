@@ -73,8 +73,33 @@ TESTDATA_URL = os.getenv(
     'https://openslide.cs.cmu.edu/download/openslide-testdata/',
 )
 DEFAULT_FROZEN_BUCKET = 'openslide-frozen-testdata'
-SRCDIR = Path(r'@SRCDIR@')
-BUILDDIR = Path(r'@BUILDDIR@')
+
+
+def _resolve_test_dirs() -> tuple[Path, Path]:
+    """Resolve source/build test dirs, tolerating stale configured paths."""
+    configured_srcdir = Path(os.getenv('OPENSLIDE_TEST_SRCDIR', r'@SRCDIR@'))
+    configured_builddir = Path(
+        os.getenv('OPENSLIDE_TEST_BUILDDIR', r'@BUILDDIR@')
+    )
+    script_builddir = Path(__file__).resolve().parent
+    script_srcdir = script_builddir.parents[1] / 'test'
+
+    srcdir = configured_srcdir
+    if not (srcdir / 'cases' / 'slides.yaml').exists() and (
+        script_srcdir / 'cases' / 'slides.yaml'
+    ).exists():
+        srcdir = script_srcdir
+
+    builddir = configured_builddir
+    if not (builddir / 'try_open').exists() and (
+        script_builddir / 'try_open'
+    ).exists():
+        builddir = script_builddir
+
+    return srcdir, builddir
+
+
+SRCDIR, BUILDDIR = _resolve_test_dirs()
 CJPEG = Path(r'@CJPEG@')
 DJPEG = Path(r'@DJPEG@')
 XDELTA3 = Path(r'@XDELTA3@')
@@ -89,7 +114,9 @@ CASEROOT = SRCDIR / 'cases'
 SLIDELIST = CASEROOT / 'slides.yaml'
 FROZENLIST = CASEROOT / 'frozen.yaml'
 MOSAICLIST = CASEROOT / 'mosaic.ini'
-CACHE = Path(os.getenv('OPENSLIDE_TEST_CACHE', r'@BUILDDIR@/_slidedata'))
+CACHE = Path(
+    os.getenv('OPENSLIDE_TEST_CACHE', (BUILDDIR / '_slidedata').as_posix())
+)
 CACHE_TAG = CACHE / 'CACHEDIR.TAG'
 WORKROOT = CACHE / 'unpacked'
 PRISTINE = CACHE / 'pristine'
