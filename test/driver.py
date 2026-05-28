@@ -364,7 +364,11 @@ class UnpackedSlide:
         )
         out, err = proc.communicate()
         if out or err:
-            return (out + err).strip()
+            return '\n'.join(
+                line
+                for line in (out + err).strip().split('\n')
+                if 'Rejecting overlarge cache entry' not in line
+            )
         elif proc.returncode:
             return f'Exited with status {proc.returncode}'
         else:
@@ -739,10 +743,7 @@ class S3Uploader:
     def __init__(self, bucket: str):
         self._s3 = boto3.client('s3')
         self._bucket = bucket
-        region = (
-            self._s3.get_bucket_location(Bucket=bucket)['LocationConstraint']
-            or 'us-east-1'
-        )
+        region = self._s3.head_bucket(Bucket=bucket)['BucketRegion']
         self._baseurl = (
             f'https://{bucket}.s3.dualstack.{region}.amazonaws.com/'
         )
